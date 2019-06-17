@@ -16,20 +16,47 @@ data Net = Net
 data Port
   = Ptr { toNode :: Int, toSlot :: Slot }
   | Free
-  deriving (Eq, Show)
+  deriving Eq
 
-data Slot = P | A1 | A2 deriving (Eq, Show)
+instance Show Port where
+  show Free      = "F"
+  show (Ptr n s) = show n ++ show s
+
+data Slot = P | L | R deriving (Eq, Show)
 type Kind = Int
 
-data Node
-  = CON { kind :: Kind, slotP :: Port, slotA1 :: Port, slotA2 :: Port }
-  | OP1 { kind :: Kind, slotP :: Port, slotA1 :: Port, numArg :: Int }
-  | OP2 { kind :: Kind, slotP :: Port, slotA1 :: Port, slotA2 :: Port }
-  | ITE { kind :: Kind, slotP :: Port, slotA1 :: Port, slotA2 :: Port }
-  | NUM { num :: Int, slotP :: Port }
+-- With the Eraser node, the mnemonic is "EZUBIN"
+data NodeType
+  = Z -- Constructor
+  | U -- Unary Arithmetic Operator
+  | B -- Binary Arithmetic Operator
+  | I -- Iterator
+  | N -- Number
   deriving (Eq, Show)
 
-data NodeType = Con | Op1 | Op2 | Ite | Num
+data Node = Node
+  { typeOf :: NodeType
+  , kind   :: Kind
+  , slotP  :: Port
+  , slotL  :: Port
+  , slotR  :: Port
+  , num    :: Int
+  } deriving Eq
+
+instance Show Node where
+  show (Node Z k sP sL sR n) =
+    concat ["Z",show k,"{",show sP,",",show sL,",",show sR,"}"]
+  show (Node U k sP sL sR n) =
+    concat ["U",show k,show n,"{",show sP,",",show sL,"}"]
+  show (Node B k sP sL sR n) =
+    concat ["B",show k,"{",show sP,",",show sL,",",show sR,"}"]
+  show (Node I k sP sL sR n) =
+    concat ["I",show k,"{",show sP,",",show sL,",",show sR,"}"]
+  show (Node N k sP sL sR n) =
+    concat ["N",show n,"{",show sP,"}"]
+
+defaultNode :: Int -> NodeType -> Kind -> Int -> Node
+defaultNode i nt k num = Node nt k (Ptr i P) (Ptr i L) (Ptr i R) num
 
 makeNet :: [Node] -> Net
 makeNet nodes = let n = M.fromList $ zip [0..] nodes in Net n [] (findRedexes n)
@@ -45,27 +72,12 @@ findRedexes nodes = deDup $ (toNode . slotP) <$> M.filterWithKey isRedex nodes
       | Set.member (v, k) s = s
       | otherwise = (Set.insert (k, v) s)
 
-defaultNode :: Int -> NodeType -> Kind -> Int -> Node
-defaultNode n Con k m = CON k (Ptr n P) (Ptr n A1) (Ptr n A2)
-defaultNode n Op1 k m = OP1 k (Ptr n P) (Ptr n A1) m
-defaultNode n Op2 k m = OP2 k (Ptr n P) (Ptr n A1) (Ptr n A2)
-defaultNode n Ite k m = ITE k (Ptr n P) (Ptr n A1) (Ptr n A2)
-defaultNode n Num k m = NUM m (Ptr n P)
-
-typeOf :: Node -> NodeType
-typeOf = \case
-  CON _ _ _ _ -> Con
-  OP1 _ _ _ _ -> Op1
-  OP2 _ _ _ _ -> Op2
-  ITE _ _ _ _ -> Ite
-  NUM _ _     -> Num
-
 slot :: Slot -> Node -> Port
-slot s n = case s of P -> slotP n; A1 -> slotA1 n; A2 -> slotA2 n
+slot s n = case s of P -> slotP n; L -> slotL n; R -> slotR n
 
 setSlot :: Slot -> Port -> Node -> Node
 setSlot s q n = case s of
-  P -> n { slotP = q }; A1 -> n {slotA1 = q }; A2 -> n { slotA2 = q }
+  P -> n { slotP = q }; L -> n {slotL = q }; R -> n { slotR = q }
 
 allocNode :: NodeType -> Kind -> Int -> State Net Int
 allocNode t k n = do
@@ -99,13 +111,14 @@ linkSlots (ia, sa) (ib, sb) = do
   when (sa == P && sb == P) $
     modify (\n -> n {netRedex = (ia,ib) : netRedex n})
 
-linkBack :: (Int, Slot) -> (Int, Slot) -> State Net ()
-linkBack (ia, sa) (ib, sb) = do
+linkPorts :: (Int, Slot) -> (Int, Slot) -> State Net ()
+linkPorts (ia, sa) (ib, sb) = do
   net <- gets netNodes
   case (getPort ia sa net, getPort ib sb net) of
     (Ptr ia' sa', Ptr ib' sb') -> linkSlots (ia', sa') (ib', sb')
     (Ptr ia' sa', x)           -> setPort ia' sa' x
     (x, Ptr ib' sb')           -> setPort ib' sb' x
+    _                          -> return ()
 
 unlinkPort :: (Int, Slot) -> State Net ()
 unlinkPort (ia, sa) = do
@@ -118,71 +131,73 @@ unlinkPort (ia, sa) = do
 
 rewrite :: (Int, Int) -> State Net ()
 rewrite (iA, iB) = do
+
+  match iA iB
+
+  freeNode iA
+  unless (iA == iB) (freeNode iB)
+
+match :: Int -> Int -> State Net ()
+match iA iB = do
   net <- gets netNodes
   let a = net M.! iA
   let b = net M.! iB
 
-  match (iA,a) (iB,b)
+  case (typeOf a, typeOf b) of
+    (Z, Z) -> if
+      | kind a == kind b -> annihilate iA iB
+      | otherwise        -> duplicate (iA, a) (iB, b)
+    (U, U) -> linkPorts (iA, L) (iB, L)
+    (B, B) -> annihilate iA iB
+    (I, I) -> annihilate iA iB
+    (N, N) -> pure ()
 
-  mapM_ (\x -> unlinkPort (iA, x)) [P,A1,A2] >> freeNode iA
-  unless (iA == iB) (mapM_ (\x -> unlinkPort (iB, x)) [P,A1,A2] >> freeNode iB)
+    (Z, B) -> duplicate (iA, a) (iB, b)
+    (Z, I) -> duplicate (iA, a) (iB, b)
+    (Z, N) -> do
+      iP <- allocNode N 0 (num b)
+      iQ <- allocNode N 0 (num b)
+      linkPorts (iA, L) (iP, P)
+      linkPorts (iA, R) (iQ, P)
 
-match :: (Int, Node) -> (Int, Node) -> State Net ()
-match (iA,a) (iB,b) = case (typeOf a, typeOf b) of
-  (Con, Con) -> if
-    | kind a == kind b -> annihilate (iA, a) (iB, b)
-    | otherwise        -> duplicate (iA, a) (iB, b)
-  (Op1, Op1) -> linkBack (iA, A1) (iB, A1)
-  (Op2, Op2) -> annihilate (iA, a) (iB, b)
-  (Ite, Ite) -> annihilate (iA, a) (iB, b)
-  (Num, Num) -> pure ()
+    (U, Z) -> duplicate1 (iA, a) (iB, b)
+    (U, B) -> duplicate1 (iA, a) (iB, b)
+    (U, I) -> duplicate1 (iA, a) (iB, b)
+    (U, N) -> do
+      let x = arithmetic (kind a) (num b) (num a)
+      iP <- allocNode N 0 (num b)
+      linkPorts (iA, L) (iP, P)
 
-  (Con, Op2) -> duplicate (iA, a) (iB, b)
-  (Con, Ite) -> duplicate (iA, a) (iB, b)
-  (Con, Num) -> do
-    iP <- allocNode Num 0 (num b)
-    iQ <- allocNode Num 0 (num b)
-    linkBack (iA, A1) (iP, P)
-    linkBack (iA, A2) (iQ, P)
+    (B, I) -> duplicate (iA, a) (iB, b)
+    (B, N) -> do
+      iP <- allocNode U (kind a) (num b)
+      linkPorts (iA, L) (iP, P)
+      linkPorts (iA, R) (iP, L)
 
-  (Op1, Con) -> duplicate1 (iA, a) (iB, b)
-  (Op1, Op2) -> duplicate1 (iA, a) (iB, b)
-  (Op1, Ite) -> duplicate1 (iA, a) (iB, b)
-  (Op1, Num) -> do
-    let x = arithmetic (kind a) (num b) (numArg a)
-    iP <- allocNode Num 0 (num b)
-    linkBack (iA, A1) (iP, P)
+    (I, N) -> do
+      iP <- allocNode Z (kind a) 0
+      linkPorts (iA, L) (iP, P)
+      if
+        | (num b) == 0 -> linkPorts (iA, R) (iP,L)
+        | otherwise    -> linkPorts (iA, R) (iP,R)
 
-  (Op2, Ite) -> duplicate (iA, a) (iB, b)
-  (Op2, Num) -> do
-    iP <- allocNode Op1 (kind a) (num b)
-    linkBack (iA, A1) (iP, P)
-    linkBack (iA, A2) (iP, A1)
+    _ -> match iB iA
 
-  (Ite, Num) -> do
-    iP <- allocNode Con (kind a) 0
-    linkBack (iA, A1) (iP, P)
-    if
-      | (num b) == 0 -> linkBack (iA, A2) (iP,A1)
-      | otherwise    -> linkBack (iA, A2) (iP,A2)
-
-  _ -> match (iB,b) (iA,a)
-
-annihilate :: (Int, Node) -> (Int, Node) -> State Net ()
-annihilate (iA, a) (iB, b) = do
-  linkBack (iA, A1) (iB, A1)
-  linkBack (iA, A2) (iB, A2)
+annihilate :: Int -> Int -> State Net ()
+annihilate iA iB = do
+  linkPorts (iA, L) (iB, L)
+  linkPorts (iA, R) (iB, R)
 
 duplicate1 :: (Int, Node) -> (Int, Node) -> State Net ()
 duplicate1 (iA, a) (iB, b) = do
   iP <- allocNode (typeOf b) (kind b) 0
   iQ <- allocNode (typeOf b) (kind b) 0
   iR <- allocNode (typeOf a) (kind a) 0
-  linkSlots (iR, A2) (iQ, A1)
-  linkSlots (iR, A1) (iP, A1)
-  linkBack (iP,P) (iA,A1)
-  linkBack (iQ,P) (iA,A2)
-  linkBack (iR,P) (iB,A1)
+  linkSlots (iR, R) (iQ, L)
+  linkSlots (iR, L) (iP, L)
+  linkPorts (iP,P) (iA,L)
+  linkPorts (iQ,P) (iA,R)
+  linkPorts (iR,P) (iB,L)
 
 duplicate :: (Int, Node) -> (Int, Node) -> State Net ()
 duplicate (iA, a) (iB, b) = do
@@ -190,14 +205,14 @@ duplicate (iA, a) (iB, b) = do
   iQ <- allocNode (typeOf b) (kind b) 0
   iR <- allocNode (typeOf a) (kind a) 0
   iS <- allocNode (typeOf a) (kind a) 0
-  linkSlots (iS, A1) (iP, A2)
-  linkSlots (iR, A2) (iQ, A1)
-  linkSlots (iS, A2) (iQ, A2)
-  linkSlots (iR, A1) (iP, A1)
-  linkBack (iP,P) (iA,A1)
-  linkBack (iQ,P) (iA,A2)
-  linkBack (iR,P) (iB,A1)
-  linkBack (iS,P) (iB,A2)
+  linkSlots (iS, L) (iP, R)
+  linkSlots (iR, R) (iQ, L)
+  linkSlots (iS, R) (iQ, R)
+  linkSlots (iR, L) (iP, L)
+  linkPorts (iP,P) (iA,L)
+  linkPorts (iQ,P) (iA,R)
+  linkPorts (iR,P) (iB,L)
+  linkPorts (iS,P) (iB,R)
 
 arithmetic :: Kind -> Int -> Int -> Int
 arithmetic f n m =
